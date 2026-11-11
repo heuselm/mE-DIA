@@ -1,0 +1,16 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* { box-sizing: border-box; }
+
+body { margin: 0; font-family: 'Segoe UI', system-ui, sans-serif; }
+
+.terminal-line { white-space: pre-wrap; word-break: break-all; }
+.terminal-line.metric { color: #86efac; font-weight: 600; }
+.terminal-line.status { color: #93c5fd; }
+.terminal-line.warn   { color: #fcd34d; }
+.terminal-line.error  { color: #f87171; }
+
+@keyframes spin { to { transform: rotate(360deg); } }
+.spinning { animation: spin 1s linear infinite; display: inline-block; }

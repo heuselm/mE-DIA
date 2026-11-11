@@ -1,0 +1,46 @@
+# Citation metadata — GitHub renders a "Cite this repository" button from this file.
+# preferred-citation is the bioRxiv preprint; update on journal publication.
+cff-version: 1.2.0
+message: "If you use mE-DIA, please cite both the software and the paper below."
+title: "mE-DIA: multi-enzyme DIA proteomics pipeline"
+abstract: >-
+  Plug-and-play multi-enzyme data-independent acquisition workflow that maximises
+  proteome sequence coverage by splitting a sample across multiple proteases,
+  recombining the digests, and co-analysing them in a single DIA-MS injection.
+  Library generation is fully in silico; no DDA runs are required.
+type: software
+authors:
+  - family-names: Heusel
+    given-names: Moritz
+    email: heusel.moritz@gmail.com
+    # orcid: "https://orcid.org/<ORCID>"
+repository-code: "https://github.com/heuselm/mE-DIA"
+license: PolyForm-Noncommercial-1.0.0
+version: 1.1.0
+date-released: "2026-11-11"
+keywords:
+  - proteomics
+  - mass spectrometry
+  - data-independent acquisition
+  - multi-enzyme digestion
+  - sequence coverage
+  - proteoform
+  - DIA-NN
+
+preferred-citation:
+  type: article
+  title: "Multi-Enzyme Data-Independent Acquisition Mass Spectrometry for Proteoform-Aware Single-shot Proteomics"
+  authors:
+    - family-names: Heusel
+      given-names: Moritz
+    - family-names: Happonen
+      given-names: Lotta
+    - family-names: Karlsson
+      given-names: Christofer
+    - family-names: Åhrman
+      given-names: Emma
+    - family-names: Malmström
+      given-names: Johan
+  journal: "bioRxiv"
+  year: 2026
+  doi: "10.64898/2026.11.06.764873"

@@ -1,0 +1,31 @@
+name: Feature request
+description: Propose a new feature or a change in behaviour
+labels: [enhancement]
+body:
+  - type: textarea
+    id: outline
+    attributes:
+      label: Feature outline
+      description: What should mE-DIA do that it does not do now?
+    validations:
+      required: true
+  - type: textarea
+    id: purpose
+    attributes:
+      label: Purpose
+      description: Which analysis, data type or user does this serve? What is not possible or hard today?
+    validations:
+      required: true
+  - type: textarea
+    id: approach
+    attributes:
+      label: Proposed approach
+      description: How would you implement it? Which parts are affected (pipeline passes, GUI, Peptide Mapper, outputs)? Any effect on existing results?
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+    validations:
+      required: false

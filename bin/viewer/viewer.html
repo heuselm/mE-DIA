@@ -1,0 +1,1524 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>mE-DIA Peptide Mapper — Conditional Tracks & Differential Discovery</title>
+    <!-- Exact versions, so a published viewer cannot change underneath its users.
+         These are the versions the viewer was verified with (2026-10-08); bump only
+         after re-testing. React 19 ships no UMD build, so React stays on 18. -->
+    <script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone@8.0.7/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com/3.4.17"></script>
+    <script src="https://unpkg.com/lucide@1.53.0/dist/umd/lucide.min.js"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500;700&display=swap');
+        body { font-family: 'Inter', sans-serif; overflow: hidden; }
+        .font-mono { font-family: 'JetBrains Mono', monospace; }
+        .icon-container svg { display: inline-block; vertical-align: middle; }
+        .custom-scrollbar::-webkit-scrollbar { width: 6px; height: 6px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 10px; }
+        .viewer-canvas { transform-origin: 0 0; cursor: grab; }
+        .viewer-canvas:active { cursor: grabbing; }
+        .no-context-menu { user-select: none; -webkit-user-select: none; }
+        .peptide-seq-label { font-size: 8px; line-height: 14px; letter-spacing: 0; pointer-events: none; user-select: none; }
+    </style>
+    <!--EMBEDDED_DATA--></head>
+<body class="bg-slate-50">
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useMemo, useEffect, useRef, useCallback } = React;
+
+        // ─── Constants ──────────────────────────────────────────────────────
+        const ENZYME_COLORS = {
+            "Trypsin":      "#2563eb",
+            "Chymotrypsin": "#d97706",
+            "GluC":         "#7c3aed",
+            "Elastase":     "#dc2626",
+            "Elastase (extended)": "#db2777",
+            "Unknown":      "#64748b",
+        };
+        const enzymeColor = (e) => ENZYME_COLORS[e] || ENZYME_COLORS.Unknown;
+
+        // Peptide uniqueness = number of proteins in Protein.Ids. One definition
+        // for box colour, legend and hover badge, so the three always agree.
+        // Distinct hues, not shades of one colour: semi-specific peptides are
+        // drawn faded, and a faded dark shade would read as a light one.
+        const UNIQUENESS_TIERS = [
+            { max: 1,        color: "#059669", label: "unique" },
+            { max: 2,        color: "#d97706", label: "2 proteins" },
+            { max: Infinity, color: "#e11d48", label: "≥3 proteins" },
+        ];
+        const uniquenessTier = (n) => UNIQUENESS_TIERS.find(t => n <= t.max);
+        const proteinAccessions = (pep) => (pep.proteinId || "").split(';').map(s => s.trim()).filter(Boolean);
+
+        const TRACK_PALETTE = [
+            "#2563eb", "#dc2626", "#16a34a", "#7c3aed", "#d97706",
+            "#0891b2", "#db2777", "#65a30d", "#0ea5e9", "#a855f7"
+        ];
+        const paletteColor = (i) => TRACK_PALETTE[((i % TRACK_PALETTE.length) + TRACK_PALETTE.length) % TRACK_PALETTE.length];
+
+        // ─── Icon ───────────────────────────────────────────────────────────
+        const Icon = ({ name, size = 18, className = "" }) => {
+            const iconRef = useRef(null);
+            useEffect(() => {
+                if (window.lucide && iconRef.current) {
+                    iconRef.current.innerHTML = '';
+                    const el = document.createElement('i');
+                    el.setAttribute('data-lucide', name);
+                    el.classList.add(...className.split(' ').filter(Boolean));
+                    el.style.width = `${size}px`;
+                    el.style.height = `${size}px`;
+                    iconRef.current.appendChild(el);
+                    window.lucide.createIcons({ node: iconRef.current });
+                }
+                return () => { if (iconRef.current) iconRef.current.innerHTML = ''; };
+            }, [name, size, className]);
+            return <span ref={iconRef} className="icon-container inline-flex items-center justify-center"></span>;
+        };
+
+        // ─── Parsers ────────────────────────────────────────────────────────
+        const parseFasta = (text) => {
+            const lines = text.split(/\r?\n/);
+            const proteins = [];
+            let header = null, seq = "";
+            lines.forEach(line => {
+                if (line.startsWith('>')) {
+                    if (header) proteins.push({ id: header, sequence: seq.replace(/\s/g, '') });
+                    header = line.substring(1);
+                    seq = "";
+                } else seq += line;
+            });
+            if (header) proteins.push({ id: header, sequence: seq.replace(/\s/g, '') });
+            return proteins;
+        };
+
+        // Same stringency as the pipeline and the manuscript (CLAUDE.md
+        // counting rules): precursor Q.Value <= 0.01 and protein-group
+        // Global.PG.Q.Value <= 0.01. A filter whose column is absent is
+        // skipped and reported, never silently assumed.
+        const FDR = 0.01;
+        const parseTsv = (text) => {
+            const lines = text.split(/\r?\n/);
+            // runs: every run in the report, before filtering, so a run keeps
+            // counting in n (and its saved annotation) even if no row passes.
+            const fdr = { total: 0, kept: 0, missing: [], runs: [] };
+            if (lines.length < 2) return { data: [], fdr };
+            const headers = lines[0].split('\t');
+            const idx = (n) => headers.indexOf(n);
+            const runIdx = idx('Run');
+            const proteinIdsIdx = idx('Protein.Ids');
+            const proteinGroupIdx = idx('Protein.Group');
+            const seqIdx = idx('Stripped.Sequence');
+            const fullPeptideIdx = idx('Modified.Sequence');
+            const enzymeIdx = idx('Enzyme');
+            const specIdx = idx('Specificity');
+            const pgQuantIdx = idx('PG.Quantity');
+            const pgMaxLfqIdx = idx('PG.MaxLFQ');
+            const qIdx = idx('Q.Value');
+            const pgQIdx = idx('Global.PG.Q.Value');
+            if (qIdx < 0) fdr.missing.push('Q.Value');
+            if (pgQIdx < 0) fdr.missing.push('Global.PG.Q.Value');
+            const passes = (cols, j) => j < 0 || parseFloat(cols[j]) <= FDR;
+            const data = [];
+            const allRuns = new Set();
+            for (let i = 1; i < lines.length; i++) {
+                const cols = lines[i].split('\t');
+                if (cols.length < headers.length) continue;
+                fdr.total++;
+                allRuns.add(cols[runIdx]);
+                if (!passes(cols, qIdx) || !passes(cols, pgQIdx)) continue;
+                const rawProteinIds = cols[proteinIdsIdx] || "";
+                data.push({
+                    run: cols[runIdx],
+                    proteinId: rawProteinIds,
+                    proteinGroup: proteinGroupIdx >= 0 ? cols[proteinGroupIdx] : "",
+                    idCount: rawProteinIds.split(';').filter(id => id.trim()).length,
+                    sequence: cols[seqIdx],
+                    fullName: cols[fullPeptideIdx] || cols[seqIdx],
+                    enzyme: enzymeIdx >= 0 ? (cols[enzymeIdx] || "Unknown") : "Unknown",
+                    specificity: specIdx >= 0 ? (cols[specIdx] || "") : "",
+                    pgQuantity: pgQuantIdx >= 0 ? parseFloat(cols[pgQuantIdx]) : NaN,
+                    pgMaxLFQ: pgMaxLfqIdx >= 0 ? parseFloat(cols[pgMaxLfqIdx]) : NaN,
+                });
+            }
+            fdr.kept = data.length;
+            fdr.runs = Array.from(allRuns).sort();
+            return { data, fdr };
+        };
+
+        // ─── Pack peptides into rows (greedy) ───────────────────────────────
+        const packPeptides = (peptides) => {
+            const sorted = [...peptides].sort((a, b) => a.start - b.start || (b.stop - b.start) - (a.stop - a.start));
+            const rows = [];
+            sorted.forEach(pep => {
+                let placed = false;
+                for (let i = 0; i < rows.length; i++) {
+                    const last = rows[i][rows[i].length - 1];
+                    if (pep.start > last.stop) {
+                        rows[i].push(pep); pep.row = i; placed = true; break;
+                    }
+                }
+                if (!placed) { pep.row = rows.length; rows.push([pep]); }
+            });
+            return rows.length;
+        };
+
+        // Map a peptide's Stripped.Sequence to all start positions in a protein sequence.
+        const mapPositions = (proteinSeq, peptideSeq) => {
+            const out = [];
+            let s = proteinSeq.indexOf(peptideSeq);
+            while (s !== -1) { out.push(s); s = proteinSeq.indexOf(peptideSeq, s + 1); }
+            return out;
+        };
+
+        // ─── Track / Coverage helpers ───────────────────────────────────────
+        // Given a list of peptide rows from the TSV and a protein sequence,
+        // build the placed-peptide list (with start/stop/row) used by tracks.
+        const buildPlacedPeptides = (rows, proteinSeq) => {
+            const placed = [];
+            rows.forEach(pep => {
+                const starts = mapPositions(proteinSeq, pep.sequence);
+                starts.forEach(s => placed.push({ ...pep, start: s + 1, stop: s + pep.sequence.length }));
+            });
+            packPeptides(placed);
+            return placed;
+        };
+
+        // Observation-frequency profile of one protein in one group of runs:
+        //   c_i = sum over peptides p covering residue i of k_p / n,
+        // with k_p the number of the group's runs in which p (Stripped.Sequence)
+        // was observed and n the number of runs in the group. Equivalently the
+        // coverage depth of residue i averaged over the group's runs, so a
+        // peptide seen in 1 of 3 runs weighs 1/3 and group size does not
+        // inflate the profile.
+        const buildFrequencyProfile = (rows, proteinSeq, nRuns) => {
+            const runsBySeq = new Map();
+            rows.forEach(r => {
+                if (!runsBySeq.has(r.sequence)) runsBySeq.set(r.sequence, new Set());
+                runsBySeq.get(r.sequence).add(r.run);
+            });
+            const prof = new Array(proteinSeq.length).fill(0);
+            if (nRuns <= 0) return prof;
+            runsBySeq.forEach((runSet, pep) => {
+                const w = runSet.size / nRuns;
+                mapPositions(proteinSeq, pep).forEach(s => {
+                    for (let i = s; i < s + pep.length; i++) prof[i] += w;
+                });
+            });
+            return prof;
+        };
+
+        // Dedupe by Stripped.Sequence (collapses replicate detections of the
+        // same peptide so it is not counted/drawn twice within a scope).
+        const dedupeBySequence = (rows) => {
+            const seen = new Set();
+            const out = [];
+            rows.forEach(r => {
+                if (seen.has(r.sequence)) return;
+                seen.add(r.sequence);
+                out.push(r);
+            });
+            return out;
+        };
+
+        // ─── Track component ────────────────────────────────────────────────
+        const Track = ({ track, placedPeptides, proteinLength, charWidth, peptideStyle,
+                          hoveredPeptide, setHoveredPeptide,
+                          pinnedPeptide,  setPinnedPeptide,
+                          showSeqInBox, onRemove }) => {
+            const nRows = Math.max(...placedPeptides.map(p => p.row || 0), 0) + 1;
+            const stackHeight = (placedPeptides.length === 0 ? 1 : nRows) * 16 + 10;
+            const samePeptide = (a, b) => a && b && a.fullName === b.fullName && a.start === b.start && a.stop === b.stop;
+            return (
+                <div className="mb-4">
+                    <div className="flex items-center gap-2 mb-1 text-[10px] font-bold text-slate-500 uppercase tracking-widest">
+                        <span className="w-3 h-3 rounded-sm" style={{ background: track.color }}></span>
+                        <span className="text-slate-700 normal-case tracking-normal">{track.label}</span>
+                        <span className="px-1.5 py-0.5 rounded bg-slate-100 text-slate-500 font-mono normal-case tracking-normal">{track.kind}</span>
+                        <span className="text-slate-400 normal-case tracking-normal">{placedPeptides.length} peptides</span>
+                        {onRemove && (
+                            <button onClick={onRemove} className="ml-auto p-1 text-slate-400 hover:text-red-500" title="Remove track">
+                                <Icon name="x" size={12} />
+                            </button>
+                        )}
+                    </div>
+                    <div className="relative" style={{ height: stackHeight + 'px', width: proteinLength * charWidth + 'px', background: "rgba(248, 250, 252, 0.5)", borderRadius: 4 }}>
+                        {placedPeptides.map((pep, idx) => {
+                            const st = peptideStyle(pep, track.color);
+                            const peptideWithCtx = { ...pep, _trackLabel: track.label };
+                            const isPinned = samePeptide(pinnedPeptide, pep);
+                            const boxWidth = (pep.stop - pep.start + 1) * charWidth;
+                            return (
+                                <div key={`pep-${track.id}-${pep.fullName}-${pep.start}-${idx}`}
+                                    className={`absolute h-3.5 rounded-sm cursor-pointer transition-all hover:z-50 hover:scale-y-125 hover:shadow-lg overflow-hidden ${isPinned ? 'ring-2 ring-slate-900 z-50' : ''}`}
+                                    style={{
+                                        left: (pep.start - 1) * charWidth + 'px',
+                                        width: boxWidth + 'px',
+                                        top: ((pep.row || 0) * 16 + 4) + 'px',
+                                        background: st.background,
+                                        border: st.border,
+                                        opacity: st.opacity,
+                                        boxSizing: 'border-box',
+                                    }}
+                                    onMouseEnter={() => setHoveredPeptide(peptideWithCtx)}
+                                    onMouseLeave={() => setHoveredPeptide(null)}
+                                    onClick={(e) => { e.stopPropagation(); setPinnedPeptide(isPinned ? null : peptideWithCtx); }}>
+                                    {showSeqInBox && boxWidth >= 6 * (pep.stop - pep.start + 1) && (
+                                        <div className="peptide-seq-label flex font-mono text-white" style={{ width: boxWidth + 'px' }}>
+                                            {pep.sequence.split('').map((aa, j) => (
+                                                <span key={j} style={{ width: charWidth + 'px', display: 'inline-block', textAlign: 'center' }}>{aa}</span>
+                                            ))}
+                                        </div>
+                                    )}
+                                </div>
+                            );
+                        })}
+                    </div>
+                </div>
+            );
+        };
+
+        // ─── Coverage density plot ──────────────────────────────────────────
+        const CoverageDensityPlot = ({ proteinLength, charWidth, profiles, profileColors, visibleProfiles, onToggleProfile, cumulative, showCumulative, onToggleCumulative }) => {
+            const H = 140;
+            const padTop = 8, padBottom = 12;
+            const usable = H - padTop - padBottom;
+
+            // Max across visible series
+            let max = 1;
+            Object.entries(profiles).forEach(([k, arr]) => {
+                if (visibleProfiles[k]) max = Math.max(max, ...arr);
+            });
+            if (showCumulative && cumulative) max = Math.max(max, ...cumulative);
+            max = Math.max(max, 1);
+
+            const W = proteinLength * charWidth;
+            const yFor = (v) => padTop + (1 - v / max) * usable;
+            const pathFor = (arr) => {
+                let d = `M 0 ${H - padBottom}`;
+                for (let i = 0; i < arr.length; i++) {
+                    d += ` L ${i * charWidth + charWidth/2} ${yFor(arr[i])}`;
+                }
+                d += ` L ${W} ${H - padBottom}`;
+                return d;
+            };
+            // Profiles are k/n-weighted, so max is usually fractional.
+            const ticks = (Number.isInteger(max) && max <= 4)
+                ? Array.from({ length: max + 1 }, (_, i) => i)
+                : [0, max / 2, max].map(v => Math.round(v * 100) / 100);
+
+            return (
+                <div>
+                    <div className="relative mb-2" style={{ height: H + 'px', width: W + 'px' }}>
+                        {/* Y-axis labels */}
+                        <div className="absolute left-[-50px] top-0 text-[9px] text-slate-400 h-full w-[44px]">
+                            {ticks.map((t, i) => (
+                                <div key={i} className="absolute right-0 pr-2 text-right" style={{ top: (yFor(t) - 6) + 'px' }}>{t}</div>
+                            ))}
+                            <div className="absolute -left-12 top-1/2 -translate-y-1/2 -rotate-90 text-[8px] uppercase tracking-widest font-bold text-slate-400 whitespace-nowrap">obs freq / residue</div>
+                        </div>
+                        <svg width={W} height={H} className="overflow-visible block">
+                            {/* horizontal gridlines */}
+                            {ticks.map((t, i) => (
+                                <line key={`g-${i}`} x1={0} x2={W} y1={yFor(t)} y2={yFor(t)} stroke="#e2e8f0" strokeWidth="1" strokeDasharray={t === 0 ? "0" : "2 4"} />
+                            ))}
+                            {/* per-condition lines */}
+                            {Object.entries(profiles).map(([k, arr]) => visibleProfiles[k] && (
+                                <path key={`p-${k}`}
+                                    d={pathFor(arr)}
+                                    fill={profileColors[k] + "14"}
+                                    stroke={profileColors[k]}
+                                    strokeWidth="1.5"
+                                    strokeLinejoin="round"
+                                />
+                            ))}
+                            {/* cumulative overlay */}
+                            {showCumulative && cumulative && (
+                                <path d={pathFor(cumulative)}
+                                    fill="none"
+                                    stroke="#475569"
+                                    strokeWidth="1.5"
+                                    strokeDasharray="3 3"
+                                />
+                            )}
+                        </svg>
+                    </div>
+
+                    {/* Legend (click to toggle) */}
+                    <div className="flex flex-wrap gap-1.5 mb-1 text-[10px] font-bold">
+                        {Object.keys(profiles).map(k => (
+                            <button key={k} onClick={() => onToggleProfile(k)}
+                                className={`flex items-center gap-1.5 px-2 py-1 rounded-full border transition-colors ${visibleProfiles[k] ? 'bg-white border-slate-200 text-slate-700' : 'bg-slate-50 border-slate-100 text-slate-300'}`}>
+                                <span className="w-2.5 h-2.5 rounded-full" style={{ background: visibleProfiles[k] ? profileColors[k] : '#cbd5e1' }}></span>
+                                {k}
+                            </button>
+                        ))}
+                        {cumulative && (
+                            <button onClick={onToggleCumulative}
+                                className={`flex items-center gap-1.5 px-2 py-1 rounded-full border ${showCumulative ? 'bg-white border-slate-200 text-slate-700' : 'bg-slate-50 border-slate-100 text-slate-300'}`}>
+                                <span className="inline-block w-3 border-t-2" style={{ borderTopStyle: 'dotted', borderColor: showCumulative ? '#475569' : '#cbd5e1' }}></span>
+                                Cumulative observation density
+                            </button>
+                        )}
+                    </div>
+                </div>
+            );
+        };
+
+        // ─── Scatter plot (Discovery tab) ───────────────────────────────────
+        const ScatterPlot = ({ data, xLabel, yLabel, onSelect, hovered, setHovered }) => {
+            if (!data || data.length === 0) {
+                return <div className="p-12 text-center text-sm text-slate-400">No proteins with peptide evidence in both conditions.</div>;
+            }
+            const W = 760, H = 520;
+            const pad = { l: 70, r: 30, t: 30, b: 60 };
+            const xs = data.map(d => d.x);
+            const ys = data.map(d => d.score);
+            const xMin = Math.min(...xs), xMax = Math.max(...xs);
+            const yMin = 0, yMax = Math.max(...ys, 1);
+            const xRange = xMax - xMin || 1;
+            const sx = (x) => pad.l + (x - xMin) / xRange * (W - pad.l - pad.r);
+            const sy = (y) => H - pad.b - (y - yMin) / (yMax - yMin) * (H - pad.t - pad.b);
+
+            const niceTicks = (lo, hi, n=5) => {
+                const span = hi - lo || 1;
+                const step = Math.pow(10, Math.floor(Math.log10(span / n)));
+                const err = (n / span) * step;
+                let s = step;
+                if (err <= 0.15) s = step * 10;
+                else if (err <= 0.35) s = step * 5;
+                else if (err <= 0.75) s = step * 2;
+                const t0 = Math.ceil(lo / s) * s;
+                const out = [];
+                for (let v = t0; v <= hi + s/1e6; v += s) out.push(Math.round(v * 1000) / 1000);
+                return out;
+            };
+            const xTicks = niceTicks(xMin, xMax);
+            const yTicks = niceTicks(yMin, yMax);
+
+            return (
+                <svg width={W} height={H} className="bg-white rounded-xl shadow-sm border border-slate-200">
+                    {/* axes */}
+                    <line x1={pad.l} x2={W - pad.r} y1={H - pad.b} y2={H - pad.b} stroke="#475569" strokeWidth="1" />
+                    <line x1={pad.l} x2={pad.l} y1={pad.t} y2={H - pad.b} stroke="#475569" strokeWidth="1" />
+                    {/* x ticks */}
+                    {xTicks.map((t, i) => (
+                        <g key={`xt-${i}`}>
+                            <line x1={sx(t)} x2={sx(t)} y1={H - pad.b} y2={H - pad.b + 4} stroke="#475569" />
+                            <text x={sx(t)} y={H - pad.b + 16} textAnchor="middle" className="fill-slate-500" style={{ fontSize: 10 }}>{t}</text>
+                            <line x1={sx(t)} x2={sx(t)} y1={pad.t} y2={H - pad.b} stroke="#f1f5f9" strokeWidth="1" />
+                        </g>
+                    ))}
+                    {/* y ticks */}
+                    {yTicks.map((t, i) => (
+                        <g key={`yt-${i}`}>
+                            <line x1={pad.l - 4} x2={pad.l} y1={sy(t)} y2={sy(t)} stroke="#475569" />
+                            <text x={pad.l - 8} y={sy(t) + 3} textAnchor="end" className="fill-slate-500" style={{ fontSize: 10 }}>{t}</text>
+                            <line x1={pad.l} x2={W - pad.r} y1={sy(t)} y2={sy(t)} stroke="#f1f5f9" strokeWidth="1" />
+                        </g>
+                    ))}
+                    {/* zero reference for logFC */}
+                    {xMin < 0 && xMax > 0 && (
+                        <line x1={sx(0)} x2={sx(0)} y1={pad.t} y2={H - pad.b} stroke="#94a3b8" strokeDasharray="4 4" />
+                    )}
+                    {/* axis labels */}
+                    <text x={(pad.l + (W - pad.r)) / 2} y={H - 12} textAnchor="middle" className="fill-slate-700 font-bold" style={{ fontSize: 11 }}>{xLabel}</text>
+                    <text transform={`rotate(-90 16 ${(pad.t + (H - pad.b)) / 2})`} x={16} y={(pad.t + (H - pad.b)) / 2} textAnchor="middle" className="fill-slate-700 font-bold" style={{ fontSize: 11 }}>{yLabel}</text>
+                    {/* dots */}
+                    {data.map((d, i) => {
+                        const isHov = hovered && hovered.acc === d.acc;
+                        return (
+                            <circle key={`pt-${d.acc}-${i}`}
+                                cx={sx(d.x)} cy={sy(d.score)}
+                                r={isHov ? 6 : 3.5}
+                                fill={isHov ? "#dc2626" : "#2563eb"}
+                                fillOpacity={isHov ? 1 : 0.55}
+                                stroke="white"
+                                strokeWidth="1"
+                                style={{ cursor: "pointer" }}
+                                onMouseEnter={() => setHovered(d)}
+                                onMouseLeave={() => setHovered(null)}
+                                onClick={() => onSelect && onSelect(d)}
+                            />
+                        );
+                    })}
+                </svg>
+            );
+        };
+
+        // ─── App ────────────────────────────────────────────────────────────
+        const App = () => {
+            // Data
+            const [fastaData, setFastaData] = useState([]);
+            const [tsvData, setTsvData] = useState([]);
+            const [fdrInfo, setFdrInfo] = useState(null);
+            const [selectedProteinId, setSelectedProteinId] = useState("");
+
+            // Tab
+            const [activeTab, setActiveTab] = useState("browser");
+
+            // Sample annotation
+            const [runMeta, setRunMeta] = useState({}); // { run: { condition, replicate } }
+            const [annotKey, setAnnotKey] = useState("");
+
+            // Tracks
+            const [tracks, setTracks] = useState([{ kind: "all", id: "__all__", label: "All data (collapsed)" }]);
+
+            // Coverage plot visibility
+            const [visibleProfiles, setVisibleProfiles] = useState({});
+            const [showCumulative, setShowCumulative] = useState(true);
+
+            // Enzyme + style
+            const [selectedEnzymes, setSelectedEnzymes] = useState({});
+            const [colorMode, setColorMode] = useState("enzyme");
+            const [semiStyle, setSemiStyle] = useState("both");
+            const [semiOpacity, setSemiOpacity] = useState(0.35);
+
+            // Discovery
+            const [cond1, setCond1] = useState("");
+            const [cond2, setCond2] = useState("");
+            const [discoveryX, setDiscoveryX] = useState("logFC");
+            const [pgMetric, setPgMetric] = useState("PG.MaxLFQ");
+            const [scatterHovered, setScatterHovered] = useState(null);
+
+            // PeptideMap UI
+            const [hoveredPeptide, setHoveredPeptide] = useState(null);
+            const [pinnedPeptide,  setPinnedPeptide]  = useState(null);
+            const [showSeqInBox,   setShowSeqInBox]   = useState(false);
+            const [searchTerm, setSearchTerm] = useState("");
+            const [isSearchOpen, setIsSearchOpen] = useState(false);
+
+            // The peptide whose guides we currently show: pinned (click) wins over hovered.
+            const activePeptide = pinnedPeptide || hoveredPeptide;
+
+            // Zoom/pan
+            const [transform, setTransform] = useState({ x: 0, y: 0, scale: 1 });
+            const viewerRef = useRef(null);
+            const isPanning = useRef(false);
+            const lastPos = useRef({ x: 0, y: 0 });
+
+            // ── File loaders (shared by buttons + drag-drop + auto-fetch) ─────
+            const loadFastaText = (text) => {
+                const parsed = parseFasta(text);
+                if (parsed.length === 0) return false;
+                setFastaData(parsed);
+                setSelectedProteinId(parsed[0].id);
+                return true;
+            };
+            const loadTsvText = (text) => {
+                const { data: parsed, fdr } = parseTsv(text);
+                setFdrInfo(fdr);
+                if (parsed.length === 0) return false;
+                setTsvData(parsed);
+                const enz = {};
+                parsed.forEach(p => { enz[p.enzyme] = true; });
+                setSelectedEnzymes(enz);
+                const runsArr = fdr.runs;
+                const key = "DIAv3_runMeta_" + runsArr.join("|");
+                setAnnotKey(key);
+                let saved = null;
+                try { saved = JSON.parse(localStorage.getItem(key) || "null"); } catch (_) {}
+                const meta = {};
+                runsArr.forEach(r => {
+                    meta[r] = (saved && saved[r]) ? saved[r] : { condition: "", replicate: "" };
+                });
+                setRunMeta(meta);
+                setTracks([{ kind: "all", id: "__all__", label: "All data (collapsed)" }]);
+                return true;
+            };
+
+            const handleFastaUpload = async (e) => {
+                const f = e.target.files[0]; if (!f) return;
+                loadFastaText(await f.text());
+            };
+            const handleTsvUpload = async (e) => {
+                const f = e.target.files[0]; if (!f) return;
+                loadTsvText(await f.text());
+            };
+
+            // ── Drag-and-drop ────────────────────────────────────────────────
+            // Drop one or both of report_annotated.tsv / report.used.fasta
+            // anywhere on the page. File classification is by extension; the
+            // .tsv branch handles report_annotated.tsv. Same loaders as the
+            // header buttons, so behavior is identical either way.
+            const [isDragging, setIsDragging] = useState(false);
+            const dragDepth = useRef(0);  // counts dragenter/leave to handle child traversal
+
+            const handleDragEnter = (e) => {
+                if (!e.dataTransfer || !e.dataTransfer.types || !e.dataTransfer.types.includes('Files')) return;
+                e.preventDefault();
+                dragDepth.current += 1;
+                if (dragDepth.current === 1) setIsDragging(true);
+            };
+            const handleDragOver = (e) => {
+                if (!e.dataTransfer || !e.dataTransfer.types || !e.dataTransfer.types.includes('Files')) return;
+                e.preventDefault();
+                e.dataTransfer.dropEffect = 'copy';
+            };
+            const handleDragLeave = (e) => {
+                dragDepth.current = Math.max(0, dragDepth.current - 1);
+                if (dragDepth.current === 0) setIsDragging(false);
+            };
+            const handleDrop = async (e) => {
+                e.preventDefault();
+                dragDepth.current = 0;
+                setIsDragging(false);
+                const files = Array.from((e.dataTransfer && e.dataTransfer.files) || []);
+                for (const f of files) {
+                    const name = (f.name || "").toLowerCase();
+                    try {
+                        if (name.endsWith('.fasta') || name.endsWith('.fa') || name.endsWith('.faa')) {
+                            loadFastaText(await f.text());
+                        } else if (name.endsWith('.tsv') || name.endsWith('.txt') || name.endsWith('.csv')) {
+                            loadTsvText(await f.text());
+                        }
+                    } catch (_) { /* skip unreadable file */ }
+                }
+            };
+
+            // Persist runMeta when it changes
+            useEffect(() => {
+                if (!annotKey) return;
+                try { localStorage.setItem(annotKey, JSON.stringify(runMeta)); } catch (_) {}
+            }, [runMeta, annotKey]);
+
+            // Status of the on-mount sibling-fetch attempt (for the splash UI).
+            const [autoLoadState, setAutoLoadState] = useState({ tried: false, report: null, fasta: null });
+
+            // ── Auto-load sibling files on mount ─────────────────────────────
+            // When this viewer is opened from a result folder via an HTTP server
+            // (mEDIA.exe / `python -m http.server` / etc.), try to fetch the
+            // canonical sibling files. On file:// the browser blocks fetch — we
+            // silently fall back to the Import buttons in the header. Filenames
+            // match what bin/run_pipeline.py writes at the end of pass2/pass4.
+            useEffect(() => {
+                let cancelled = false;
+                const tryFetch = async (path) => {
+                    try {
+                        const r = await fetch(path, { cache: "no-store" });
+                        if (!r.ok) return null;
+                        return await r.text();
+                    } catch (_) { return null; }
+                };
+                (async () => {
+                    const [fastaText, reportText] = await Promise.all([
+                        tryFetch("./report.used.fasta"),
+                        tryFetch("./report_annotated.tsv"),
+                    ]);
+                    if (cancelled) return;
+                    const fastaOk  = fastaText  ? loadFastaText(fastaText)  : false;
+                    const reportOk = reportText ? loadTsvText(reportText)   : false;
+                    setAutoLoadState({ tried: true, report: reportOk, fasta: fastaOk });
+                })();
+                return () => { cancelled = true; };
+            }, []);  // mount-only
+
+            // ── Derived ──────────────────────────────────────────────────────
+            const targetProtein = useMemo(() =>
+                fastaData.find(p => p.id === selectedProteinId),
+            [fastaData, selectedProteinId]);
+
+            const runs = useMemo(() => Object.keys(runMeta).sort(), [runMeta]);
+
+            const conditions = useMemo(() => {
+                const set = new Set();
+                Object.values(runMeta).forEach(m => { if (m && m.condition && m.condition.trim()) set.add(m.condition.trim()); });
+                return Array.from(set).sort();
+            }, [runMeta]);
+
+            const runsByCondition = useMemo(() => {
+                const out = {};
+                conditions.forEach(c => out[c] = []);
+                Object.entries(runMeta).forEach(([run, m]) => {
+                    const c = (m && m.condition || "").trim();
+                    if (c && out[c]) out[c].push(run);
+                });
+                return out;
+            }, [conditions, runMeta]);
+
+            const conditionColor = useMemo(() => {
+                const out = {};
+                conditions.forEach((c, i) => out[c] = paletteColor(i));
+                return out;
+            }, [conditions]);
+
+            const enzymesPresent = useMemo(() =>
+                Array.from(new Set(tsvData.map(d => d.enzyme))).sort(),
+            [tsvData]);
+
+            // Initialise visibility map for coverage profiles
+            useEffect(() => {
+                setVisibleProfiles(prev => {
+                    const next = { ...prev };
+                    const keys = conditions.length > 0 ? conditions : ["All data"];
+                    keys.forEach(k => { if (!(k in next)) next[k] = true; });
+                    Object.keys(next).forEach(k => { if (!keys.includes(k)) delete next[k]; });
+                    return next;
+                });
+            }, [conditions]);
+
+            // Initialise discovery cond1/cond2 when conditions become available
+            useEffect(() => {
+                if (conditions.length >= 2) {
+                    if (!cond1 || !conditions.includes(cond1)) setCond1(conditions[0]);
+                    if (!cond2 || !conditions.includes(cond2) || cond2 === conditions[0]) setCond2(conditions[1]);
+                }
+            }, [conditions]);
+
+            // Prune dropped tracks (e.g. when a condition is removed)
+            useEffect(() => {
+                setTracks(prev => prev.filter(t => {
+                    if (t.kind === "all") return true;
+                    if (t.kind === "run") return runs.includes(t.id);
+                    if (t.kind === "condition") return conditions.includes(t.id);
+                    return false;
+                }));
+            }, [runs, conditions]);
+
+            // ── Track peptides ───────────────────────────────────────────────
+            const tracksWithPeptides = useMemo(() => {
+                if (!targetProtein) return [];
+                const searchId = selectedProteinId.split('|')[1] || selectedProteinId;
+                const seq = targetProtein.sequence;
+                const enzPass = (e) => selectedEnzymes[e] !== false;
+
+                return tracks.map((t, i) => {
+                    let rows;
+                    if (t.kind === "run") {
+                        rows = tsvData.filter(p => p.run === t.id && p.proteinId.includes(searchId) && enzPass(p.enzyme));
+                    } else if (t.kind === "condition") {
+                        const set = new Set(runsByCondition[t.id] || []);
+                        const sel = tsvData.filter(p => set.has(p.run) && p.proteinId.includes(searchId) && enzPass(p.enzyme));
+                        rows = dedupeBySequence(sel);
+                    } else { // all
+                        const sel = tsvData.filter(p => p.proteinId.includes(searchId) && enzPass(p.enzyme));
+                        rows = dedupeBySequence(sel);
+                    }
+                    const placed = buildPlacedPeptides(rows, seq);
+                    const color = t.kind === "condition" ? (conditionColor[t.id] || "#475569")
+                                : t.kind === "run"       ? paletteColor(runs.indexOf(t.id) + 3)
+                                : "#475569";
+                    return { ...t, color, placed };
+                });
+            }, [tracks, tsvData, runsByCondition, targetProtein, selectedProteinId, selectedEnzymes, conditionColor, runs]);
+
+            // ── Coverage profiles per condition ─────────────────────────────
+            const coverage = useMemo(() => {
+                if (!targetProtein) return { profiles: {}, profileColors: {}, cumulative: null };
+                const searchId = selectedProteinId.split('|')[1] || selectedProteinId;
+                const seq = targetProtein.sequence;
+                const enzPass = (e) => selectedEnzymes[e] !== false;
+                const profiles = {};
+                const colors = {};
+
+                if (conditions.length === 0) {
+                    const sel = tsvData.filter(p => p.proteinId.includes(searchId) && enzPass(p.enzyme));
+                    profiles["All data"] = buildFrequencyProfile(sel, seq, runs.length);
+                    colors["All data"] = "#2563eb";
+                } else {
+                    conditions.forEach(c => {
+                        const set = new Set(runsByCondition[c] || []);
+                        const sel = tsvData.filter(p => set.has(p.run) && p.proteinId.includes(searchId) && enzPass(p.enzyme));
+                        profiles[c] = buildFrequencyProfile(sel, seq, set.size);
+                        colors[c] = conditionColor[c];
+                    });
+                }
+                const len = seq.length;
+                const cumulative = new Array(len).fill(0);
+                Object.values(profiles).forEach(arr => {
+                    for (let i = 0; i < len; i++) cumulative[i] += arr[i];
+                });
+                return { profiles, profileColors: colors, cumulative };
+            }, [targetProtein, tsvData, selectedProteinId, selectedEnzymes, conditions, runsByCondition, conditionColor, runs]);
+
+            // ── Discovery computation ───────────────────────────────────────
+            const discoveryRows = useMemo(() => {
+                if (activeTab !== "discovery") return null;
+                if (!cond1 || !cond2 || cond1 === cond2) return null;
+                if (fastaData.length === 0 || tsvData.length === 0) return null;
+
+                const runs1 = new Set(runsByCondition[cond1] || []);
+                const runs2 = new Set(runsByCondition[cond2] || []);
+                if (runs1.size === 0 || runs2.size === 0) return null;
+                const enzPass = (e) => selectedEnzymes[e] !== false;
+
+                // pgByRun[run] : { acc: q }
+                const pgByRun = {};
+                tsvData.forEach(row => {
+                    if (!runs1.has(row.run) && !runs2.has(row.run)) return;
+                    const q = pgMetric === "PG.MaxLFQ" ? row.pgMaxLFQ : row.pgQuantity;
+                    if (!isFinite(q) || q <= 0) return;
+                    const ids = row.proteinId.split(';').map(s => s.trim()).filter(Boolean);
+                    if (!pgByRun[row.run]) pgByRun[row.run] = {};
+                    const bag = pgByRun[row.run];
+                    ids.forEach(acc => { if (!(acc in bag)) bag[acc] = q; });
+                });
+
+                // Index TSV rows by accession for speed (each row may match multiple accessions).
+                const rowsByAcc = {};
+                tsvData.forEach(row => {
+                    if (!runs1.has(row.run) && !runs2.has(row.run)) return;
+                    if (!enzPass(row.enzyme)) return;
+                    const ids = row.proteinId.split(';').map(s => s.trim()).filter(Boolean);
+                    ids.forEach(acc => {
+                        if (!rowsByAcc[acc]) rowsByAcc[acc] = [];
+                        rowsByAcc[acc].push(row);
+                    });
+                });
+
+                const out = [];
+                fastaData.forEach(prot => {
+                    const acc = prot.id.split('|')[1] || prot.id;
+                    const rows = rowsByAcc[acc];
+                    if (!rows || rows.length === 0) return;
+                    const seq = prot.sequence;
+                    const len = seq.length;
+                    const rows1 = rows.filter(r => runs1.has(r.run));
+                    const rows2 = rows.filter(r => runs2.has(r.run));
+                    const seen1 = new Set(rows1.map(r => r.sequence));
+                    const seen2 = new Set(rows2.map(r => r.sequence));
+                    // S compares observation patterns, so it needs evidence in both
+                    // groups. A protein seen in one group only would get S = total
+                    // frequency of the other: on/off is presence, not pattern, and
+                    // belongs to conventional differential-abundance analysis.
+                    if (seen1.size === 0 || seen2.size === 0) return;
+
+                    // k-of-n observation-frequency profiles (see buildFrequencyProfile)
+                    const p1 = buildFrequencyProfile(rows1, seq, runs1.size);
+                    const p2 = buildFrequencyProfile(rows2, seq, runs2.size);
+                    let score = 0;
+                    for (let i = 0; i < len; i++) score += Math.abs(p1[i] - p2[i]);
+
+                    const q1s = [], q2s = [];
+                    runs1.forEach(r => { const v = pgByRun[r]?.[acc]; if (v) q1s.push(v); });
+                    runs2.forEach(r => { const v = pgByRun[r]?.[acc]; if (v) q2s.push(v); });
+                    const mean1 = q1s.length ? q1s.reduce((a, b) => a + b, 0) / q1s.length : null;
+                    const mean2 = q2s.length ? q2s.reduce((a, b) => a + b, 0) / q2s.length : null;
+
+                    let x = null;
+                    if (discoveryX === "logFC") {
+                        if (mean1 && mean2) x = Math.log2(mean1 / mean2);
+                    } else {
+                        const all = [...q1s, ...q2s];
+                        if (all.length) x = Math.log10(all.reduce((a, b) => a + b, 0) / all.length);
+                    }
+                    if (x === null || !isFinite(x)) return;
+
+                    out.push({
+                        acc,
+                        proteinId: prot.id,
+                        score,
+                        x,
+                        n1: seen1.size,
+                        n2: seen2.size,
+                        mean1, mean2,
+                    });
+                });
+                return out;
+            }, [activeTab, fastaData, tsvData, cond1, cond2, runsByCondition, discoveryX, pgMetric, selectedEnzymes]);
+
+            // ── Zoom/pan handlers ───────────────────────────────────────────
+            const handleWheel = (e) => {
+                e.preventDefault();
+                const f = e.deltaY > 0 ? 0.9 : 1.1;
+                const ns = Math.min(Math.max(transform.scale * f, 0.1), 10);
+                const rect = viewerRef.current.getBoundingClientRect();
+                const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+                setTransform({
+                    x: mx - (mx - transform.x) * (ns / transform.scale),
+                    y: my - (my - transform.y) * (ns / transform.scale),
+                    scale: ns
+                });
+            };
+            const handleMouseDown = (e) => {
+                if (e.button === 2) { isPanning.current = true; lastPos.current = { x: e.clientX, y: e.clientY }; }
+            };
+            const handleMouseMove = (e) => {
+                if (isPanning.current) {
+                    const dx = e.clientX - lastPos.current.x, dy = e.clientY - lastPos.current.y;
+                    setTransform(prev => ({ ...prev, x: prev.x + dx, y: prev.y + dy }));
+                    lastPos.current = { x: e.clientX, y: e.clientY };
+                }
+            };
+            const handleMouseUp = () => { isPanning.current = false; };
+            const preventContext = (e) => e.preventDefault();
+            const resetView = () => setTransform({ x: 0, y: 0, scale: 1 });
+
+            // ── Protein search ──────────────────────────────────────────────
+            const filteredProteinOptions = useMemo(() =>
+                fastaData.filter(p => p.id.toLowerCase().includes(searchTerm.toLowerCase())),
+            [fastaData, searchTerm]);
+
+            // ── Track add/remove ────────────────────────────────────────────
+            const addRunTrack = (runId) => {
+                if (!runId) return;
+                if (tracks.some(t => t.kind === "run" && t.id === runId)) return;
+                setTracks(prev => [...prev, { kind: "run", id: runId, label: runId }]);
+            };
+            const addConditionTrack = (c) => {
+                if (!c) return;
+                if (tracks.some(t => t.kind === "condition" && t.id === c)) return;
+                setTracks(prev => [...prev, { kind: "condition", id: c, label: c + " (condition)" }]);
+            };
+            const removeTrack = (kind, id) => {
+                setTracks(prev => prev.filter(t => !(t.kind === kind && t.id === id)));
+            };
+
+            // ── Sample annotation helpers ───────────────────────────────────
+            const setRunField = (run, field, value) => {
+                setRunMeta(prev => ({ ...prev, [run]: { ...(prev[run] || {}), [field]: value } }));
+            };
+            const autoFillAnnotation = () => {
+                // Heuristic: split on _ then take the token containing letters but not _DIA*; last token = replicate.
+                const next = { ...runMeta };
+                runs.forEach(r => {
+                    const parts = r.split('_');
+                    // Replicate: last segment if it matches r[a-z\d]+ or rep\d
+                    let rep = "";
+                    const last = parts[parts.length - 1];
+                    if (/^r[a-z]$/i.test(last) || /^rep\d+$/i.test(last) || /^\d+$/.test(last)) rep = last;
+                    // Condition: the third token in mE-DIA file naming (e.g. *_TCE_*), else the
+                    // second-to-last informative token. Fallback: index-2 token.
+                    let cond = "";
+                    const ix = parts.findIndex(p => /^(TCE|TCGE|SM|MS|S)$/.test(p));
+                    if (ix > 0) cond = parts.slice(0, ix).filter(p => /[A-Za-z]{2,}/.test(p)).slice(-1)[0] || parts[ix - 1];
+                    if (!cond && parts.length >= 2) {
+                        const candidate = parts.find(p => /^[A-Z][A-Za-z0-9]{0,4}$/.test(p) && p !== last);
+                        cond = candidate || parts[parts.length - 2];
+                    }
+                    next[r] = { condition: cond || "", replicate: rep || "" };
+                });
+                setRunMeta(next);
+            };
+            const clearAnnotation = () => {
+                const next = {};
+                runs.forEach(r => next[r] = { condition: "", replicate: "" });
+                setRunMeta(next);
+            };
+
+            // ── Peptide style (enzyme/uniqueness/track + semi-specific) ─────────────
+            const peptideStyle = (pep, trackColor) => {
+                const isSemi = pep.specificity && pep.specificity !== "fully_specific";
+                let bg, border;
+                if (colorMode === "enzyme") {
+                    bg = enzymeColor(pep.enzyme);
+                    border = "1px solid rgba(255,255,255,0.6)";
+                } else if (colorMode === "uniqueness") {
+                    bg = uniquenessTier(pep.idCount).color;
+                    border = "1px solid rgba(255,255,255,0.6)";
+                } else { // "track"
+                    bg = trackColor;
+                    border = "1px solid rgba(255,255,255,0.6)";
+                }
+                let opacity = 1;
+                if (isSemi && (semiStyle === "opacity" || semiStyle === "both")) opacity = semiOpacity;
+                if (isSemi && (semiStyle === "outline" || semiStyle === "both")) border = "1.5px dashed #0f172a";
+                if (hoveredPeptide && hoveredPeptide !== pep && hoveredPeptide.fullName !== pep.fullName) opacity = Math.min(opacity, 0.2);
+                return { background: bg, border, opacity };
+            };
+
+            // ── Render ───────────────────────────────────────────────────────
+            const charWidth = 12;
+            const seqHeight = 32;
+
+            return (
+                <div className="h-screen flex flex-col text-slate-900 no-context-menu relative"
+                     onMouseMove={handleMouseMove}
+                     onMouseUp={handleMouseUp}
+                     onContextMenu={preventContext}
+                     onDragEnter={handleDragEnter}
+                     onDragOver={handleDragOver}
+                     onDragLeave={handleDragLeave}
+                     onDrop={handleDrop}>
+                    {isDragging && (
+                        <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-blue-500/10 backdrop-blur-sm pointer-events-none">
+                            <div className="bg-white rounded-2xl shadow-2xl px-8 py-6 text-center border-4 border-dashed border-blue-400">
+                                <div className="text-3xl mb-2">📥</div>
+                                <div className="font-semibold text-slate-700">Drop files to load</div>
+                                <div className="text-xs text-slate-500 mt-1 font-mono">.fasta · .tsv (report_annotated)</div>
+                            </div>
+                        </div>
+                    )}
+
+                    {/* Header */}
+                    <header className="bg-white border-b border-slate-200 p-4 flex justify-between items-center z-50">
+                        <div className="flex items-center gap-6">
+                            <div>
+                                <h1 className="text-xl font-bold text-slate-800 tracking-tight flex items-center gap-2">
+                                    <Icon name="dna" className="text-blue-600" /> mE-DIA Peptide Mapper
+                                </h1>
+                                <p className="text-[10px] text-slate-500 uppercase font-bold tracking-widest">Multi-track peptide map &amp; per-protein contrast</p>
+                                {/* The FDR filter runs silently; speak up only if it could not. */}
+                                {fdrInfo && fdrInfo.missing.length > 0 && (
+                                    <p className="text-[10px] font-bold text-amber-700"
+                                       title="Expected: precursor Q.Value ≤ 0.01 and protein-group Global.PG.Q.Value ≤ 0.01, as in the pipeline">
+                                        WARNING: report has no {fdrInfo.missing.join(" / ")} column; that FDR filter was not applied
+                                    </p>
+                                )}
+                            </div>
+
+                            <div className="flex gap-1 bg-slate-100 rounded-lg p-1">
+                                {["browser", "discovery"].map(t => (
+                                    <button key={t} onClick={() => setActiveTab(t)}
+                                        className={`px-3 py-1 text-xs font-bold rounded ${activeTab === t ? 'bg-white shadow-sm text-slate-900' : 'text-slate-500 hover:text-slate-700'}`}>
+                                        {t === "browser" ? "PeptideMap" : "Differential Discovery"}
+                                    </button>
+                                ))}
+                            </div>
+                        </div>
+                        <div className="flex gap-3">
+                            {activeTab === "browser" && (
+                                <button onClick={resetView} className="px-3 py-1.5 text-xs font-bold text-slate-600 hover:bg-slate-100 rounded-lg flex items-center gap-1 border border-slate-200">
+                                    <Icon name="refresh-cw" size={14} /> Reset View
+                                </button>
+                            )}
+                            <label className="flex items-center gap-2 bg-blue-50 text-blue-700 px-3 py-1.5 rounded-lg cursor-pointer hover:bg-blue-100 text-xs font-bold border border-blue-200">
+                                <Icon name="file-text" size={14} /> FASTA
+                                <input type="file" className="hidden" accept=".fasta,.fa" onChange={handleFastaUpload} />
+                            </label>
+                            <label className="flex items-center gap-2 bg-emerald-50 text-emerald-700 px-3 py-1.5 rounded-lg cursor-pointer hover:bg-emerald-100 text-xs font-bold border border-emerald-200">
+                                <Icon name="activity" size={14} /> TSV (report_annotated)
+                                <input type="file" className="hidden" accept=".tsv" onChange={handleTsvUpload} />
+                            </label>
+                        </div>
+                    </header>
+
+                    <div className="flex-1 flex overflow-hidden">
+
+                        {/* Sidebar */}
+                        <aside className="w-96 bg-white border-r border-slate-200 p-5 space-y-5 z-40 shadow-sm custom-scrollbar overflow-y-auto">
+
+                            {activeTab === "browser" && (
+                                <>
+                                    {/* Protein */}
+                                    <section>
+                                        <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-2">Protein Selection</label>
+                                        <div className="relative">
+                                            <div className="flex items-center bg-slate-50 border border-slate-200 rounded-lg px-2 focus-within:ring-2 focus-within:ring-blue-500">
+                                                <Icon name="search" size={14} className="text-slate-400" />
+                                                <input type="text" placeholder="Search protein..." className="bg-transparent w-full p-2 text-xs outline-none"
+                                                    value={searchTerm}
+                                                    onChange={(e) => { setSearchTerm(e.target.value); setIsSearchOpen(true); }}
+                                                    onFocus={() => setIsSearchOpen(true)} />
+                                            </div>
+                                            {isSearchOpen && (
+                                                <div className="absolute top-full left-0 w-full mt-1 bg-white border border-slate-200 rounded-lg shadow-xl max-h-60 overflow-y-auto z-[60] custom-scrollbar">
+                                                    {filteredProteinOptions.length > 0 ? filteredProteinOptions.slice(0, 200).map((p, idx) => (
+                                                        <div key={idx}
+                                                            className={`p-2 text-xs cursor-pointer border-b border-slate-50 last:border-0 hover:bg-blue-50 ${selectedProteinId === p.id ? 'bg-blue-50 font-bold text-blue-700' : ''}`}
+                                                            onClick={() => { setSelectedProteinId(p.id); setSearchTerm(""); setIsSearchOpen(false); }}>
+                                                            {p.id}
+                                                        </div>
+                                                    )) : <div className="p-3 text-[10px] text-slate-400 text-center">No proteins found</div>}
+                                                </div>
+                                            )}
+                                            {isSearchOpen && <div className="fixed inset-0 z-[55]" onClick={() => setIsSearchOpen(false)} />}
+                                        </div>
+                                    </section>
+
+                                    {/* Samples annotation */}
+                                    <section>
+                                        <div className="flex items-center justify-between mb-2">
+                                            <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-widest">Samples</label>
+                                            <div className="flex gap-1">
+                                                <button onClick={autoFillAnnotation} className="text-[9px] font-bold text-slate-500 hover:text-slate-800 px-1.5 py-0.5 rounded border border-slate-200" title="Heuristic parse from run name">Auto</button>
+                                                <button onClick={clearAnnotation} className="text-[9px] font-bold text-slate-500 hover:text-slate-800 px-1.5 py-0.5 rounded border border-slate-200">Clear</button>
+                                            </div>
+                                        </div>
+                                        <div className="border border-slate-200 rounded-lg max-h-56 overflow-y-auto custom-scrollbar">
+                                            <table className="w-full text-[10px]">
+                                                <thead className="bg-slate-50 sticky top-0">
+                                                    <tr>
+                                                        <th className="p-1.5 text-left font-bold text-slate-400">Run</th>
+                                                        <th className="p-1.5 text-left font-bold text-slate-400">Condition</th>
+                                                        <th className="p-1.5 text-left font-bold text-slate-400">Rep</th>
+                                                    </tr>
+                                                </thead>
+                                                <tbody>
+                                                    {runs.map(r => (
+                                                        <tr key={r} className="border-t border-slate-100">
+                                                            <td className="p-1.5 font-mono text-slate-600 truncate max-w-[120px]" title={r}>{r}</td>
+                                                            <td className="p-1"><input value={runMeta[r]?.condition || ""} onChange={(e) => setRunField(r, "condition", e.target.value)} className="w-full px-1 py-0.5 bg-slate-50 rounded border border-slate-200" placeholder="cond" /></td>
+                                                            <td className="p-1"><input value={runMeta[r]?.replicate || ""} onChange={(e) => setRunField(r, "replicate", e.target.value)} className="w-full px-1 py-0.5 bg-slate-50 rounded border border-slate-200" placeholder="rep" /></td>
+                                                        </tr>
+                                                    ))}
+                                                    {runs.length === 0 && (
+                                                        <tr><td colSpan="3" className="p-2 text-slate-400 text-center">Load TSV to populate</td></tr>
+                                                    )}
+                                                </tbody>
+                                            </table>
+                                        </div>
+                                        {conditions.length > 0 && (
+                                            <div className="mt-2 flex flex-wrap gap-1 text-[9px]">
+                                                {conditions.map(c => (
+                                                    <span key={c} className="px-1.5 py-0.5 rounded font-bold text-white" style={{ background: conditionColor[c] }}>
+                                                        {c} · {runsByCondition[c].length}
+                                                    </span>
+                                                ))}
+                                            </div>
+                                        )}
+                                    </section>
+
+                                    {/* Tracks */}
+                                    <section>
+                                        <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-2">Tracks</label>
+                                        <div className="space-y-2">
+                                            <div className="flex gap-1">
+                                                <select onChange={(e) => { addRunTrack(e.target.value); e.target.value = ""; }} className="flex-1 text-[11px] bg-slate-50 border border-slate-200 rounded p-1">
+                                                    <option value="">+ Add run track…</option>
+                                                    {runs.map(r => <option key={r} value={r}>{r}</option>)}
+                                                </select>
+                                            </div>
+                                            <div className="flex gap-1">
+                                                <select onChange={(e) => { addConditionTrack(e.target.value); e.target.value = ""; }} className="flex-1 text-[11px] bg-slate-50 border border-slate-200 rounded p-1" disabled={conditions.length === 0}>
+                                                    <option value="">+ Add condition track…</option>
+                                                    {conditions.map(c => <option key={c} value={c}>{c}</option>)}
+                                                </select>
+                                            </div>
+                                            <div className="space-y-1">
+                                                {tracks.map(t => (
+                                                    <div key={t.kind + t.id} className="flex items-center gap-2 text-[11px] bg-slate-50 px-2 py-1 rounded border border-slate-200">
+                                                        <span className="w-2.5 h-2.5 rounded-sm" style={{
+                                                            background: t.kind === "condition" ? (conditionColor[t.id] || "#475569")
+                                                                      : t.kind === "run" ? paletteColor(runs.indexOf(t.id) + 3)
+                                                                      : "#475569"
+                                                        }}></span>
+                                                        <span className="truncate flex-1" title={t.label}>{t.label}</span>
+                                                        <span className="text-slate-400 font-mono">{t.kind}</span>
+                                                        {t.kind !== "all" && (
+                                                            <button onClick={() => removeTrack(t.kind, t.id)} className="text-slate-400 hover:text-red-500" title="Remove">
+                                                                <Icon name="x" size={11} />
+                                                            </button>
+                                                        )}
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        </div>
+                                    </section>
+
+                                    {/* Enzymes */}
+                                    <section>
+                                        <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-2">Enzymes</label>
+                                        <div className="space-y-1">
+                                            {enzymesPresent.map(e => (
+                                                <label key={e} className="flex items-center gap-2 text-xs cursor-pointer">
+                                                    <input type="checkbox" checked={selectedEnzymes[e] !== false} onChange={() => setSelectedEnzymes(prev => ({ ...prev, [e]: !(prev[e] !== false) }))} />
+                                                    <span className="w-3 h-3 rounded-sm" style={{ background: enzymeColor(e) }}></span>
+                                                    <span>{e}</span>
+                                                </label>
+                                            ))}
+                                            {enzymesPresent.length === 0 && <div className="text-[10px] text-slate-400">Load TSV to see enzymes</div>}
+                                        </div>
+                                    </section>
+
+                                    {/* Display options */}
+                                    <section>
+                                        <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-2">Display</label>
+                                        <label className="flex items-center gap-2 text-xs cursor-pointer">
+                                            <input type="checkbox" checked={showSeqInBox} onChange={(e) => setShowSeqInBox(e.target.checked)} />
+                                            <span>Show peptide sequence inside boxes</span>
+                                        </label>
+                                        {pinnedPeptide && (
+                                            <button onClick={() => setPinnedPeptide(null)}
+                                                className="mt-2 text-[10px] font-bold text-slate-500 hover:text-slate-900 px-2 py-1 rounded border border-slate-200 bg-slate-50 hover:bg-white">
+                                                Clear pinned guides
+                                            </button>
+                                        )}
+                                    </section>
+
+                                    {/* Color mode */}
+                                    <section>
+                                        <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-2">Color Mode</label>
+                                        <div className="flex gap-1">
+                                            {["enzyme", "uniqueness", "track"].map(m => (
+                                                <button key={m} onClick={() => setColorMode(m)}
+                                                    className={`flex-1 px-2 py-1.5 text-[11px] font-bold rounded-lg border ${colorMode === m ? 'bg-slate-900 text-white border-slate-900' : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'}`}>
+                                                    {m}
+                                                </button>
+                                            ))}
+                                        </div>
+                                        {colorMode === "uniqueness" && (
+                                            <div className="flex flex-wrap gap-2 mt-2 text-[10px] text-slate-500">
+                                                {UNIQUENESS_TIERS.map(t => (
+                                                    <span key={t.label} className="flex items-center gap-1">
+                                                        <span className="w-3 h-3 rounded-sm" style={{ background: t.color }}></span>{t.label}
+                                                    </span>
+                                                ))}
+                                            </div>
+                                        )}
+                                    </section>
+
+                                    {/* Semi-specific style */}
+                                    <section>
+                                        <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-2">Semi-specific Style</label>
+                                        <div className="grid grid-cols-2 gap-1 mb-2">
+                                            {["opacity", "outline", "both", "none"].map(s => (
+                                                <button key={s} onClick={() => setSemiStyle(s)}
+                                                    className={`px-2 py-1.5 text-[11px] font-bold rounded-lg border ${semiStyle === s ? 'bg-slate-900 text-white border-slate-900' : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'}`}>
+                                                    {s}
+                                                </button>
+                                            ))}
+                                        </div>
+                                        {(semiStyle === "opacity" || semiStyle === "both") && (
+                                            <div className="flex items-center gap-2 text-[10px] text-slate-500">
+                                                <span>opacity</span>
+                                                <input type="range" min="0.05" max="1" step="0.05" value={semiOpacity}
+                                                    onChange={(e) => setSemiOpacity(parseFloat(e.target.value))} className="flex-1" />
+                                                <span className="font-mono w-8">{semiOpacity.toFixed(2)}</span>
+                                            </div>
+                                        )}
+                                    </section>
+
+                                    {/* Hover info */}
+                                    {hoveredPeptide && (
+                                        <section className="bg-slate-900 text-white p-4 rounded-xl shadow-lg">
+                                            <div className="flex items-center gap-2 text-[10px] font-bold text-slate-400 mb-3 uppercase tracking-tighter">
+                                                <Icon name="info" size={12} /> Peptide Info
+                                            </div>
+                                            <div className="font-mono text-xs break-all mb-3 text-emerald-400 leading-tight bg-slate-800 p-2 rounded">{hoveredPeptide.fullName}</div>
+                                            <div className="space-y-1.5 text-[10px]">
+                                                <div className="flex justify-between"><span className="text-slate-400">Track:</span> <span className="font-mono text-[9px] ml-2 truncate">{hoveredPeptide._trackLabel || "—"}</span></div>
+                                                <div className="flex justify-between"><span className="text-slate-400">Span:</span> <span>{hoveredPeptide.start}-{hoveredPeptide.stop} ({hoveredPeptide.sequence.length} AA)</span></div>
+                                                <div className="flex justify-between"><span className="text-slate-400">Run:</span> <span className="font-mono text-[9px] truncate ml-2">{hoveredPeptide.run}</span></div>
+                                                <div className="flex justify-between items-center">
+                                                    <span className="text-slate-400">Enzyme:</span>
+                                                    <span className="px-1.5 py-0.5 rounded text-white" style={{ background: enzymeColor(hoveredPeptide.enzyme) }}>{hoveredPeptide.enzyme}</span>
+                                                </div>
+                                                <div className="flex justify-between items-center">
+                                                    <span className="text-slate-400">Specificity:</span>
+                                                    <span className={`px-1.5 py-0.5 rounded ${hoveredPeptide.specificity === 'fully_specific' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-amber-500/20 text-amber-400'}`}>
+                                                        {hoveredPeptide.specificity || 'n/a'}
+                                                    </span>
+                                                </div>
+                                                <div className="flex justify-between items-start gap-3">
+                                                    <span className="text-slate-400">Proteins:</span>
+                                                    <span className="text-right">
+                                                        <span className="px-1.5 py-0.5 rounded text-white" style={{ background: uniquenessTier(hoveredPeptide.idCount).color }}>
+                                                            {hoveredPeptide.idCount === 1 ? 'unique' : `shared by ${hoveredPeptide.idCount}`}
+                                                        </span>
+                                                        <span className="block mt-1 font-mono text-[10px] text-slate-300 break-all">
+                                                            {proteinAccessions(hoveredPeptide).join(', ')}
+                                                        </span>
+                                                    </span>
+                                                </div>
+                                            </div>
+                                        </section>
+                                    )}
+                                </>
+                            )}
+
+                            {activeTab === "discovery" && (
+                                <>
+                                    <section>
+                                        <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-2">Contrast</label>
+                                        {conditions.length < 2 && (
+                                            <div className="text-[10px] text-amber-700 bg-amber-50 border border-amber-200 rounded p-2 mb-2">
+                                                Annotate at least two conditions in the <b>Samples</b> table (PeptideMap tab) to enable contrasts.
+                                            </div>
+                                        )}
+                                        <div className="space-y-2">
+                                            <div>
+                                                <div className="text-[9px] font-bold text-slate-400 mb-1">Condition 1 (numerator)</div>
+                                                <select value={cond1} onChange={(e) => setCond1(e.target.value)} className="w-full text-xs bg-slate-50 border border-slate-200 rounded p-1.5">
+                                                    {conditions.map(c => <option key={c} value={c}>{c} ({(runsByCondition[c]||[]).length})</option>)}
+                                                </select>
+                                            </div>
+                                            <div>
+                                                <div className="text-[9px] font-bold text-slate-400 mb-1">Condition 2 (denominator)</div>
+                                                <select value={cond2} onChange={(e) => setCond2(e.target.value)} className="w-full text-xs bg-slate-50 border border-slate-200 rounded p-1.5">
+                                                    {conditions.map(c => <option key={c} value={c}>{c} ({(runsByCondition[c]||[]).length})</option>)}
+                                                </select>
+                                            </div>
+                                        </div>
+                                    </section>
+
+                                    <section>
+                                        <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-2">X-axis</label>
+                                        <div className="grid grid-cols-1 gap-1">
+                                            <button onClick={() => setDiscoveryX("logFC")} className={`px-2 py-1.5 text-[11px] font-bold rounded-lg border text-left ${discoveryX === "logFC" ? 'bg-slate-900 text-white border-slate-900' : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'}`}>
+                                                log₂ fold change (cond1 / cond2)
+                                            </button>
+                                            <button onClick={() => setDiscoveryX("cumAbund")} className={`px-2 py-1.5 text-[11px] font-bold rounded-lg border text-left ${discoveryX === "cumAbund" ? 'bg-slate-900 text-white border-slate-900' : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'}`}>
+                                                log₁₀ cumulative abundance
+                                            </button>
+                                        </div>
+                                    </section>
+
+                                    <section>
+                                        <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-2">PG metric</label>
+                                        <div className="flex gap-1">
+                                            {["PG.MaxLFQ", "PG.Quantity"].map(m => (
+                                                <button key={m} onClick={() => setPgMetric(m)}
+                                                    className={`flex-1 px-2 py-1.5 text-[11px] font-bold rounded-lg border ${pgMetric === m ? 'bg-slate-900 text-white border-slate-900' : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'}`}>
+                                                    {m}
+                                                </button>
+                                            ))}
+                                        </div>
+                                    </section>
+
+                                    <section>
+                                        <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-2">Enzymes (applied to score)</label>
+                                        <div className="space-y-1">
+                                            {enzymesPresent.map(e => (
+                                                <label key={e} className="flex items-center gap-2 text-xs cursor-pointer">
+                                                    <input type="checkbox" checked={selectedEnzymes[e] !== false} onChange={() => setSelectedEnzymes(prev => ({ ...prev, [e]: !(prev[e] !== false) }))} />
+                                                    <span className="w-3 h-3 rounded-sm" style={{ background: enzymeColor(e) }}></span>
+                                                    <span>{e}</span>
+                                                </label>
+                                            ))}
+                                        </div>
+                                    </section>
+
+                                    {scatterHovered && (
+                                        <section className="bg-slate-900 text-white p-4 rounded-xl shadow-lg text-[11px]">
+                                            <div className="font-mono text-emerald-400 mb-2 break-all">{scatterHovered.proteinId}</div>
+                                            <div className="space-y-1">
+                                                <div className="flex justify-between"><span className="text-slate-400">S (Σ|f1−f2|):</span> <span className="font-mono">{scatterHovered.score.toFixed(2)}</span></div>
+                                                <div className="flex justify-between"><span className="text-slate-400">{discoveryX === "logFC" ? "log₂FC:" : "log₁₀⟨PG⟩:"}</span> <span className="font-mono">{scatterHovered.x.toFixed(3)}</span></div>
+                                                <div className="flex justify-between"><span className="text-slate-400">peptides ({cond1}/{cond2}):</span> <span className="font-mono">{scatterHovered.n1} / {scatterHovered.n2}</span></div>
+                                                <div className="text-slate-400 mt-2 text-[10px]">Click the dot to inspect in PeptideMap.</div>
+                                            </div>
+                                        </section>
+                                    )}
+                                </>
+                            )}
+                        </aside>
+
+                        {/* Main */}
+                        <main className="flex-1 relative bg-slate-100 overflow-hidden cursor-crosshair"
+                              ref={viewerRef}
+                              onWheel={activeTab === "browser" ? handleWheel : undefined}
+                              onMouseDown={activeTab === "browser" ? handleMouseDown : undefined}>
+
+                            {activeTab === "browser" && (
+                                !targetProtein ? (
+                                    <div className="absolute inset-0 flex flex-col items-center justify-center text-slate-400 p-10 text-center">
+                                        <div className="p-8 bg-white rounded-3xl shadow-sm border border-slate-200 max-w-md">
+                                            <Icon name="upload-cloud" size={48} className="mb-4 mx-auto opacity-20" />
+                                            <p className="font-semibold text-slate-600 mb-2 text-sm">Load data to start</p>
+                                            <p className="text-xs text-slate-500">
+                                                Drop <span className="font-mono">report_annotated.tsv</span> and <span className="font-mono">report.used.fasta</span> onto this page,
+                                                or use the <b>FASTA</b> / <b>TSV</b> buttons in the top-right.
+                                            </p>
+                                        </div>
+                                    </div>
+                                ) : (
+                                    <div className="viewer-canvas" style={{ transform: `translate(${transform.x}px, ${transform.y}px) scale(${transform.scale})` }}>
+                                        <div className="inline-block p-16 bg-white min-w-max shadow-2xl rounded-[40px] m-10 border border-slate-200">
+                                            <div className="mb-8">
+                                                <h2 className="text-lg font-bold text-slate-800 mb-1 flex items-center gap-3">
+                                                    <div className="h-6 w-1 bg-blue-600 rounded-full"></div>
+                                                    {selectedProteinId.split('|')[1] || selectedProteinId.split(/\s+/)[0]}
+                                                </h2>
+                                                <div className="text-[11px] text-slate-600 font-normal mb-2 ml-4 break-all">
+                                                    &gt;{selectedProteinId}
+                                                </div>
+                                                <div className="flex gap-4 text-[10px] text-slate-400 font-bold uppercase tracking-widest">
+                                                    <span>Total length: {targetProtein.sequence.length} residues</span>
+                                                    <span className="text-slate-200">|</span>
+                                                    <span>{tracksWithPeptides.length} tracks</span>
+                                                    <span className="text-slate-200">|</span>
+                                                    <span>{conditions.length} conditions</span>
+                                                </div>
+                                            </div>
+
+                                            {/* Coverage density plot */}
+                                            <CoverageDensityPlot
+                                                proteinLength={targetProtein.sequence.length}
+                                                charWidth={charWidth}
+                                                profiles={coverage.profiles}
+                                                profileColors={coverage.profileColors}
+                                                visibleProfiles={visibleProfiles}
+                                                onToggleProfile={(k) => setVisibleProfiles(prev => ({ ...prev, [k]: !prev[k] }))}
+                                                cumulative={coverage.cumulative}
+                                                showCumulative={showCumulative}
+                                                onToggleCumulative={() => setShowCumulative(s => !s)}
+                                            />
+
+                                            {/* Backbone + tracks wrapped so a single SVG can draw guides across both */}
+                                            <div className="relative">
+                                            {/* Sequence backbone (no numbering above) */}
+                                            <div className="mt-4">
+                                                <div className="relative" style={{ height: seqHeight + 'px', width: targetProtein.sequence.length * charWidth + 'px' }}>
+                                                    <div className="absolute inset-0 flex bg-slate-50 border-2 border-slate-200 rounded-xl overflow-hidden shadow-inner">
+                                                        {targetProtein.sequence.split('').map((aa, i) => {
+                                                            const occ = coverage.cumulative ? (coverage.cumulative[i] / Math.max(1, Math.max(...coverage.cumulative))) : 0;
+                                                            return (
+                                                                <div key={`r-${selectedProteinId}-${i}`}
+                                                                    className="flex-shrink-0 flex items-center justify-center text-[10px] font-mono font-bold border-r border-white/20"
+                                                                    style={{
+                                                                        width: charWidth + 'px',
+                                                                        backgroundColor: occ > 0 ? `rgba(6, 78, 59, ${0.1 + (occ * 0.85)})` : 'transparent',
+                                                                        color: occ > 0.5 ? 'white' : '#64748b'
+                                                                    }}>
+                                                                    {aa}
+                                                                </div>
+                                                            );
+                                                        })}
+                                                    </div>
+                                                </div>
+
+                                                {/* AA numbering BELOW the backbone */}
+                                                <div className="relative" style={{ height: 18, width: targetProtein.sequence.length * charWidth + 'px' }}>
+                                                    {targetProtein.sequence.split('').map((_, i) => (
+                                                        (i % 10 === 0) && (
+                                                            <div key={`tickb-${i}`} className="absolute text-[9px] font-bold text-slate-400 border-l-2 border-slate-200 h-3 pl-1.5"
+                                                                style={{ left: i * charWidth, top: 0 }}>
+                                                                {i + 1}
+                                                            </div>
+                                                        )
+                                                    ))}
+                                                </div>
+                                            </div>
+
+                                            {/* Tracks */}
+                                            <div className="mt-6 pt-4 border-t border-slate-100">
+                                                {tracksWithPeptides.length === 0 ? (
+                                                    <div className="text-xs text-slate-400 p-4 text-center border border-dashed border-slate-200 rounded-lg">No tracks. Add run or condition tracks from the sidebar.</div>
+                                                ) : (
+                                                    tracksWithPeptides.map(t => (
+                                                        <Track key={t.kind + t.id}
+                                                            track={t}
+                                                            placedPeptides={t.placed}
+                                                            proteinLength={targetProtein.sequence.length}
+                                                            charWidth={charWidth}
+                                                            peptideStyle={peptideStyle}
+                                                            hoveredPeptide={hoveredPeptide}
+                                                            setHoveredPeptide={setHoveredPeptide}
+                                                            pinnedPeptide={pinnedPeptide}
+                                                            setPinnedPeptide={setPinnedPeptide}
+                                                            showSeqInBox={showSeqInBox}
+                                                            onRemove={t.kind !== "all" ? () => removeTrack(t.kind, t.id) : null}
+                                                        />
+                                                    ))
+                                                )}
+                                            </div>
+                                            {/* Vertical guide overlay: dotted lines from backbone down through the
+                                                hovered (or pinned) peptide's start/stop columns, plus residue labels. */}
+                                            {activePeptide && (() => {
+                                                const proteinLen = targetProtein.sequence.length;
+                                                const startX = (activePeptide.start - 1) * charWidth + 0.5;
+                                                const stopX  = activePeptide.stop * charWidth - 0.5;
+                                                return (
+                                                    <svg className="absolute pointer-events-none"
+                                                         style={{ left: 0, top: 0, width: proteinLen * charWidth + 'px', height: '100%' }}>
+                                                        <line x1={startX} x2={startX} y1={0} y2="100%"
+                                                              stroke="#0f172a" strokeWidth="1"
+                                                              strokeDasharray="3 3" opacity="0.55" />
+                                                        <line x1={stopX} x2={stopX} y1={0} y2="100%"
+                                                              stroke="#0f172a" strokeWidth="1"
+                                                              strokeDasharray="3 3" opacity="0.55" />
+                                                        {/* Start label (above backbone) */}
+                                                        <g transform={`translate(${startX}, -2)`}>
+                                                            <rect x={-14} y={-14} width={28} height={14} rx="3" fill="#0f172a" opacity="0.9" />
+                                                            <text x={0} y={-3} textAnchor="middle" fontSize="10" fontWeight="700" fill="#fff">{activePeptide.start}</text>
+                                                        </g>
+                                                        <g transform={`translate(${stopX}, -2)`}>
+                                                            <rect x={-14} y={-14} width={28} height={14} rx="3" fill="#0f172a" opacity="0.9" />
+                                                            <text x={0} y={-3} textAnchor="middle" fontSize="10" fontWeight="700" fill="#fff">{activePeptide.stop}</text>
+                                                        </g>
+                                                    </svg>
+                                                );
+                                            })()}
+                                            </div>
+                                        </div>
+                                    </div>
+                                )
+                            )}
+
+                            {activeTab === "discovery" && (
+                                <div className="absolute inset-0 overflow-auto p-8 custom-scrollbar">
+                                    <div className="max-w-4xl mx-auto">
+                                        <div className="mb-4">
+                                            <h2 className="text-lg font-bold text-slate-800 mb-1">Differential Discovery — per-protein contrast</h2>
+                                            <p className="text-xs text-slate-500">
+                                                Y: <b>S</b> = Σᵢ |fᵢ({cond1 || "cond1"}) − fᵢ({cond2 || "cond2"})| over the protein backbone, where fᵢ is the observation frequency of residue i: Σ over peptides covering i of k/n (peptide seen in k of the condition's n runs).
+                                                {" "}Only proteins with peptide evidence in both conditions are scored. Not normalised for protein length or peptide count, so long proteins tend to score higher.
+                                                {" "}X: {discoveryX === "logFC" ? <>log₂ ratio of <b>{pgMetric}</b> means</> : <>log₁₀ of <b>{pgMetric}</b> mean across both conditions</>}.
+                                            </p>
+                                        </div>
+                                        {!discoveryRows ? (
+                                            <div className="bg-white rounded-xl border border-slate-200 p-8 text-center text-sm text-slate-400">
+                                                {conditions.length < 2 ? "Annotate ≥ 2 conditions to enable Differential Discovery." : "Pick two distinct conditions in the sidebar."}
+                                            </div>
+                                        ) : (
+                                            <>
+                                                <ScatterPlot
+                                                    data={discoveryRows}
+                                                    xLabel={discoveryX === "logFC" ? `log₂(${pgMetric} ⟨${cond1}⟩ / ${pgMetric} ⟨${cond2}⟩)` : `log₁₀ ⟨${pgMetric}⟩`}
+                                                    yLabel="S = Σ |observation-frequency difference|"
+                                                    hovered={scatterHovered}
+                                                    setHovered={setScatterHovered}
+                                                    onSelect={(d) => {
+                                                        const match = fastaData.find(p => (p.id.split('|')[1] || p.id) === d.acc);
+                                                        if (match) {
+                                                            setSelectedProteinId(match.id);
+                                                            setActiveTab("browser");
+                                                        }
+                                                    }}
+                                                />
+                                                <div className="mt-3 text-[11px] text-slate-500 flex flex-wrap gap-3">
+                                                    <span><b>{discoveryRows.length}</b> proteins plotted</span>
+                                                    <span>Top S: <b>{Math.max(...discoveryRows.map(r => r.score)).toFixed(2)}</b></span>
+                                                    <span>X range: {Math.min(...discoveryRows.map(r => r.x)).toFixed(2)} … {Math.max(...discoveryRows.map(r => r.x)).toFixed(2)}</span>
+                                                </div>
+
+                                                {/* Top hits table */}
+                                                <div className="mt-6 bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+                                                    <div className="px-4 py-2 bg-slate-50 border-b border-slate-200 text-[10px] font-bold text-slate-500 uppercase tracking-widest">Top 20 by S</div>
+                                                    <table className="w-full text-[11px]">
+                                                        <thead className="bg-slate-50/50">
+                                                            <tr className="text-left text-slate-400 font-bold">
+                                                                <th className="px-3 py-1.5">#</th>
+                                                                <th className="px-3 py-1.5">Protein</th>
+                                                                <th className="px-3 py-1.5 text-right">S</th>
+                                                                <th className="px-3 py-1.5 text-right">X</th>
+                                                                <th className="px-3 py-1.5 text-right" title="distinct peptides observed in cond1">pep({cond1})</th>
+                                                                <th className="px-3 py-1.5 text-right" title="distinct peptides observed in cond2">pep({cond2})</th>
+                                                            </tr>
+                                                        </thead>
+                                                        <tbody>
+                                                            {[...discoveryRows].sort((a, b) => b.score - a.score).slice(0, 20).map((d, i) => (
+                                                                <tr key={d.acc} className="border-t border-slate-100 hover:bg-blue-50 cursor-pointer"
+                                                                    onClick={() => {
+                                                                        const match = fastaData.find(p => (p.id.split('|')[1] || p.id) === d.acc);
+                                                                        if (match) { setSelectedProteinId(match.id); setActiveTab("browser"); }
+                                                                    }}>
+                                                                    <td className="px-3 py-1 text-slate-400">{i + 1}</td>
+                                                                    <td className="px-3 py-1 font-mono">{d.proteinId.split('|').slice(0, 2).join('|')}</td>
+                                                                    <td className="px-3 py-1 text-right font-mono">{d.score.toFixed(2)}</td>
+                                                                    <td className="px-3 py-1 text-right font-mono">{d.x.toFixed(3)}</td>
+                                                                    <td className="px-3 py-1 text-right font-mono">{d.n1}</td>
+                                                                    <td className="px-3 py-1 text-right font-mono">{d.n2}</td>
+                                                                </tr>
+                                                            ))}
+                                                        </tbody>
+                                                    </table>
+                                                </div>
+                                            </>
+                                        )}
+                                    </div>
+                                </div>
+                            )}
+
+                            {/* Scale indicator (Browser only) */}
+                            {activeTab === "browser" && (
+                                <div className="absolute bottom-6 left-6 bg-white/80 backdrop-blur-md border border-slate-200 px-3 py-1.5 rounded-full text-[10px] font-bold text-slate-500 shadow-sm pointer-events-none z-50">
+                                    Zoom: {(transform.scale * 100).toFixed(0)}% | Right-click to Pan
+                                </div>
+                            )}
+                        </main>
+                    </div>
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>

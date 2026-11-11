@@ -1,0 +1,29 @@
+# Normalise line endings: this repo was developed on Windows, then WSL, and is
+# now also used from Linux cloud sessions. Text is LF in the repository; Git
+# decides what counts as text.
+* text=auto eol=lf
+
+*.sh      text eol=lf
+*.py      text eol=lf
+*.md      text eol=lf
+*.json    text eol=lf
+*.tsv     text eol=lf
+*.ts      text eol=lf
+*.tsx     text eol=lf
+*.css     text eol=lf
+*.html    text eol=lf
+*.cff     text eol=lf
+
+# Windows-only helpers keep CRLF, so they still run if any are added back
+*.ps1     text eol=crlf
+*.bat     text eol=crlf
+*.cmd     text eol=crlf
+
+# Never touch binaries
+*.png     binary
+*.pdf     binary
+*.xlsx    binary
+*.exe     binary
+*.speclib binary
+*.raw     binary
+*.mzML    binary

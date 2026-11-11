@@ -1,0 +1,52 @@
+# ─── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ─── Node / React UI ─────────────────────────────────────────────────────────
+bin/ui/node_modules/
+# bin/ui/dist is committed in this repository so source installs need no Node.js
+
+# ─── PyInstaller build artefacts ─────────────────────────────────────────────
+# Builds land in dist/ named mEDIA-<branch>-<sha>[-dirty].exe and are shipped
+# as GitHub Release assets, never committed. bin/_build_info.py is generated at
+# build time by bin/build_exe.py.
+bin/_build_info.py
+/mEDIA*.exe
+/mEDIA*.exe.sha256
+/build/
+/dist/
+/python_portable/
+bin/build/
+bin/dist/
+bin/mEDIA.exe
+bin/python_portable/
+
+# ─── Local user state (ship bin/config.example.json instead) ─────────────────
+/config.json
+bin/config.json
+
+# ─── Data, results, manuscripts (never committed) ────────────────────────────
+*.raw
+*.mzML
+*.d/
+*.quant
+*.speclib
+*.predicted.speclib
+*.fasta
+report*.tsv
+pipeline.log
+pipeline.settings
+results/
+pass[1-4]_*/
+
+# ─── OS / editor ─────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+mEDIA.spec
+bin/mEDIA.spec

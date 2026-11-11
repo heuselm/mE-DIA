@@ -1,0 +1,58 @@
+name: Bug report
+description: Something does not work as documented
+labels: [bug]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What happened, and what did you expect instead?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Settings used (attach or paste `pipeline.settings` if a run was involved), and the steps that trigger the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Error output
+      description: The relevant end of `pipeline.log`, the GUI Terminal tab, or the browser console.
+      render: text
+    validations:
+      required: false
+  - type: dropdown
+    id: install
+    attributes:
+      label: How do you run mE-DIA?
+      options:
+        - mEDIA.exe (Windows)
+        - From source on Windows
+        - From source on Linux
+        - From source on WSL
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: mE-DIA version
+      description: Output of `mEDIA.exe --version`, or `buildInfo` from `pipeline.settings`
+    validations:
+      required: true
+  - type: textarea
+    id: env
+    attributes:
+      label: Execution environment
+      description: OS and version, DIA-NN version, Python version (source installs), RAM, browser (GUI/Peptide Mapper issues), input file type (.raw / .mzML)
+    validations:
+      required: true
+  - type: textarea
+    id: fix
+    attributes:
+      label: Intended fix (optional)
+      description: If you plan to fix it, describe the approach.
+    validations:
+      required: false

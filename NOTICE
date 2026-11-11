@@ -1,0 +1,26 @@
+mE-DIA — Multi-enzyme DIA proteomics pipeline
+Copyright 2026 Moritz Heusel
+
+Software: licensed under the PolyForm Noncommercial License 1.0.0 (see LICENSE).
+Use for research, teaching and other noncommercial purposes is permitted, including
+by noncommercial organisations such as universities and public research institutes.
+Commercial use requires a separate license: heusel.moritz@gmail.com
+
+Documentation and figures (README, docs/, docs/img/): licensed under Creative Commons
+Attribution-NonCommercial 4.0 International (CC BY-NC 4.0), the same license as the
+accompanying preprint. https://creativecommons.org/licenses/by-nc/4.0/
+
+If you use mE-DIA in work that leads to a publication, please cite:
+
+  Heusel M, Happonen L, Karlsson C, Åhrman E, Malmström J. Multi-Enzyme
+  Data-Independent Acquisition Mass Spectrometry for Proteoform-Aware Single-shot
+  Proteomics. bioRxiv 2026. doi:10.64898/2026.11.06.764873
+
+and the underlying search engine:
+
+  Demichev V, Messner CB, Vernardis SI, Lilley KS, Ralser M. DIA-NN: neural
+  networks and interference correction enable deep proteome coverage in high
+  throughput. Nat Methods 2020; 17:41-44.
+
+DIA-NN is a separate program under its own license. mE-DIA invokes it but does not
+distribute it.
